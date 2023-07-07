@@ -76,10 +76,11 @@ var responseWriterStatePool = sync.Pool{
 
 // Test hooks.
 var (
-	testHookOnConn        func()
-	testHookGetServerConn func(*serverConn)
-	testHookOnPanicMu     *sync.Mutex // nil except in tests
-	testHookOnPanic       func(sc *serverConn, panicVal interface{}) (rePanic bool)
+	testHookOnConn                 func()
+	testHookGetServerConn          func(*serverConn)
+	testHookOnPanicMu              *sync.Mutex // nil except in tests
+	testHookOnPanic                func(sc *serverConn, panicVal interface{}) (rePanic bool)
+	testHookDisableConnectProtocol bool
 )
 
 // Server is an HTTP/2 server.
@@ -160,6 +161,13 @@ func (s *Server) initialConnRecvWindowSize() int32 {
 		return s.MaxUploadBufferPerConnection
 	}
 	return 1 << 20
+}
+
+func (s *Server) enableConnectProtocol() uint32 {
+	if testHookDisableConnectProtocol {
+		return 0
+	}
+	return 1
 }
 
 func (s *Server) initialStreamRecvWindowSize() int32 {
@@ -901,6 +909,7 @@ func (sc *serverConn) serve() {
 			{SettingMaxHeaderListSize, sc.maxHeaderListSize()},
 			{SettingHeaderTableSize, sc.srv.maxDecoderHeaderTableSize()},
 			{SettingInitialWindowSize, uint32(sc.srv.initialStreamRecvWindowSize())},
+			{SettingEnableConnectProtocol, sc.srv.enableConnectProtocol()},
 		},
 	})
 	sc.unackedSettings++
@@ -2145,7 +2154,11 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	}
 
 	isConnect := rp.method == "CONNECT"
-	if isConnect {
+	// Per https://datatracker.ietf.org/doc/html/rfc8441#section-4, extended
+	// CONNECT requests (i.e. those with the protocol pseudo-header) follow the
+	// standard 8.1.2.6 validation requirements.
+	isExtendedConnect := isConnect && f.PseudoValue("protocol") != "" && !testHookDisableConnectProtocol
+	if isConnect && !isExtendedConnect {
 		if rp.path != "" || rp.scheme != "" || rp.authority == "" {
 			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 		}
@@ -2166,6 +2179,9 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	rp.header = make(http.Header)
 	for _, hf := range f.RegularFields() {
 		rp.header.Add(sc.canonicalHeader(hf.Name), hf.Value)
+	}
+	if isExtendedConnect {
+		rp.header.Set(":protocol", f.PseudoValue("protocol"))
 	}
 	if rp.authority == "" {
 		rp.authority = rp.header.Get("Host")

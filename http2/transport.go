@@ -312,6 +312,7 @@ type ClientConn struct {
 	closing         bool
 	closed          bool
 	seenSettings    bool                     // true if we've seen a settings frame, false otherwise
+	seenSettingsCh  chan struct{}            // closed if we've seen a settings frame
 	wantSettingsAck bool                     // we sent a SETTINGS frame and haven't heard back
 	goAway          *GoAwayFrame             // if non-nil, the GoAwayFrame we received
 	goAwayDebug     string                   // goAway frame's debug data, retained as a string
@@ -329,6 +330,7 @@ type ClientConn struct {
 	peerMaxHeaderListSize  uint64
 	peerMaxHeaderTableSize uint32
 	initialWindowSize      uint32
+	enableConnectProtocol  bool
 
 	// reqHeaderMu is a 1-element semaphore channel controlling access to sending new requests.
 	// Write to reqHeaderMu to lock it, read from it to unlock.
@@ -747,6 +749,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		peerMaxHeaderListSize: 0xffffffffffffffff,          // "infinite", per spec. Use 2^64-1 instead.
 		streams:               make(map[uint32]*clientStream),
 		singleUse:             singleUse,
+		seenSettingsCh:        make(chan struct{}),
 		wantSettingsAck:       true,
 		pings:                 make(map[[8]byte]chan struct{}),
 		reqHeaderMu:           make(chan struct{}, 1),
@@ -1173,6 +1176,12 @@ func (cc *ClientConn) responseHeaderTimeout() time.Duration {
 	return 0
 }
 
+func (cc *ClientConn) enableConnectProtcolLocked() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.enableConnectProtocol
+}
+
 // checkConnHeaders checks whether req has any invalid connection-level headers.
 // per RFC 7540 section 8.1.2.2: Connection-Specific Header Fields.
 // Certain headers are special-cased as okay but not transmitted later.
@@ -1370,6 +1379,7 @@ func (cs *clientStream) writeRequest(req *http.Request) (err error) {
 	if isConnectionCloseRequest(req) {
 		cc.doNotReuse = true
 	}
+	seenSettings := cc.seenSettings
 	cc.mu.Unlock()
 
 	// TODO(bradfitz): this is a copy of the logic in net/http. Unify somewhere?
@@ -1398,6 +1408,17 @@ func (cs *clientStream) writeRequest(req *http.Request) (err error) {
 			continueTimeout = 0
 		} else {
 			cs.on100 = make(chan struct{}, 1)
+		}
+	}
+
+	if !seenSettings && isExtendedConnect(req) {
+		// We need to wait for the first settings frame to be presented on the
+		// server so that extended CONNECT requests don't fail on newly established
+		// connections.
+		select {
+		case <-cc.seenSettingsCh:
+		case <-req.Context().Done():
+			return req.Context().Err()
 		}
 	}
 
@@ -1876,7 +1897,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 	}
 
 	var path string
-	if req.Method != "CONNECT" {
+	if req.Method != "CONNECT" || isExtendedConnect(req) {
 		path = req.URL.RequestURI()
 		if !validPseudoPath(path) {
 			orig := path
@@ -1895,7 +1916,11 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 	// potentially pollute our hpack state. (We want to be able to
 	// continue to reuse the hpack encoder for future requests)
 	for k, vv := range req.Header {
-		if !httpguts.ValidHeaderFieldName(k) {
+		if k == ":protocol" {
+			if !cc.enableConnectProtcolLocked() {
+				return nil, fmt.Errorf("server did not advertise ENABLE_CONNECT_PROTOCOL: %w", http.ErrNotSupported)
+			}
+		} else if !httpguts.ValidHeaderFieldName(k) {
 			return nil, fmt.Errorf("invalid HTTP header name %q", k)
 		}
 		for _, v := range vv {
@@ -1918,7 +1943,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			m = http.MethodGet
 		}
 		f(":method", m)
-		if req.Method != "CONNECT" {
+		if req.Method != "CONNECT" || isExtendedConnect(req) {
 			f(":path", path)
 			f(":scheme", req.URL.Scheme)
 		}
@@ -2852,6 +2877,13 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 		case SettingHeaderTableSize:
 			cc.henc.SetMaxDynamicTableSize(s.Val)
 			cc.peerMaxHeaderTableSize = s.Val
+		case SettingEnableConnectProtocol:
+			if cc.enableConnectProtocol && s.Val == 0 {
+				// A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter
+				// with the value of 0 after previously sending a value of 1.
+				return ConnectionError(ErrCodeProtocol)
+			}
+			cc.enableConnectProtocol = s.Val == 1
 		default:
 			cc.vlogf("Unhandled Setting: %v", s)
 		}
@@ -2870,6 +2902,7 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 			cc.maxConcurrentStreams = defaultMaxConcurrentStreams
 		}
 		cc.seenSettings = true
+		close(cc.seenSettingsCh)
 	}
 
 	return nil
@@ -3124,6 +3157,12 @@ func (t *Transport) idleConnTimeout() time.Duration {
 		return t.t1.IdleConnTimeout
 	}
 	return 0
+}
+
+func isExtendedConnect(req *http.Request) bool {
+	return req.Method == "CONNECT" &&
+		req.Header != nil &&
+		len(req.Header[":protocol"]) > 0
 }
 
 func traceGetConn(req *http.Request, hostPort string) {

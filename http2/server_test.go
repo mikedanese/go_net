@@ -720,6 +720,125 @@ func TestServer_Request_Get(t *testing.T) {
 	})
 }
 
+func TestServer_Request_ExtendedConnect(t *testing.T) {
+	reqDone := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		defer close(reqDone)
+		handleServerPingPong(t, w, r)
+	})
+	defer st.Close()
+
+	var sawEnableConnectProtocolSetting bool
+	st.greetAndCheckSettings(func(s Setting) error {
+		if s.ID != SettingEnableConnectProtocol {
+			return nil
+		}
+		sawEnableConnectProtocolSetting = true
+		if s.Val != 1 {
+			return fmt.Errorf("SettingEnableConnectProtocol = %d; want 1", s.Val)
+		}
+		return nil
+	})
+	if !sawEnableConnectProtocolSetting {
+		t.Errorf("Never saw SettingEnableConnectProtocol")
+	}
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: st.encodeHeader(
+			":method", "CONNECT",
+			":protocol", "pingpong"),
+		EndHeaders: true,
+	})
+
+	hf := st.wantHeaders()
+	if hf.StreamEnded() {
+		t.Fatal("unexpected END_STREAM")
+	}
+	if !hf.HeadersEnded() {
+		t.Fatal("want END_HEADERS flag")
+	}
+	if got, want := st.decodeHeader(hf.HeaderBlockFragment()), [][2]string{{":status", "200"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Got headers %v; want %v", got, want)
+	}
+
+	st.writeData(1, false, []byte("ping"))
+	df := st.wantData()
+	if !bytes.Equal(df.Data(), []byte("pong")) {
+		t.Errorf("Got data %v; want %v", df.Data(), []byte("pong"))
+	}
+	if hf.StreamEnded() {
+		t.Fatal("unexpected END_STREAM")
+	}
+
+	st.writeData(1, true, nil)
+
+	<-reqDone
+}
+
+func TestServer_Request_ExtendedConnectDisabled(t *testing.T) {
+	testHookDisableConnectProtocol = true
+	t.Cleanup(func() {
+		testHookDisableConnectProtocol = false
+	})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("Should have resulted in protocol error")
+	})
+	defer st.Close()
+
+	var sawEnableConnectProtocolSetting bool
+	st.greetAndCheckSettings(func(s Setting) error {
+		if s.ID != SettingEnableConnectProtocol {
+			return nil
+		}
+		sawEnableConnectProtocolSetting = true
+		if s.Val != 0 {
+			return fmt.Errorf("SettingEnableConnectProtocol = %d; want 0", s.Val)
+		}
+		return nil
+	})
+	if !sawEnableConnectProtocolSetting {
+		t.Errorf("Never saw SettingEnableConnectProtocol")
+	}
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID: 1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(
+			":method", "CONNECT",
+			":protocol", "pingpong"),
+		EndHeaders: true,
+	})
+
+	st.wantRSTStream(1, ErrCodeProtocol)
+}
+
+func handleServerPingPong(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+
+	if r.Method != "CONNECT" {
+		t.Errorf("Method = %q; want GET", r.Method)
+	}
+	if r.Header.Get(":protocol") != "pingpong" {
+		t.Errorf(":protocol = %q; want pingpong", r.Header.Get("Protocol"))
+	}
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+
+	var buf bytes.Buffer
+	if n, err := io.Copy(&buf, io.LimitReader(r.Body, 4)); err != nil || n != 4 {
+		t.Errorf("Read = %d, %v; want 4, nil", n, err)
+	}
+	if got, want := buf.String(), "ping"; got != want {
+		t.Errorf("Read %q; want %q", got, want)
+	}
+	if _, err := io.WriteString(w, "pong"); err != nil {
+		t.Errorf("WriteString = %v; want nil", err)
+	}
+	w.(http.Flusher).Flush()
+
+	io.Copy(io.Discard, r.Body)
+}
+
 func TestServer_Request_Get_PathSlashes(t *testing.T) {
 	testServerRequest(t, func(st *serverTester) {
 		st.writeHeaders(HeadersFrameParam{

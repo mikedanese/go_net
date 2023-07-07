@@ -1189,6 +1189,105 @@ func TestTransportConnectRequest(t *testing.T) {
 	}
 }
 
+func TestTransportExtendedConnect_NilBody(t *testing.T) {
+	reqDone := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		defer close(reqDone)
+	}, optOnlyServer)
+	defer st.Close()
+
+	req, err := http.NewRequest("CONNECT", st.ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header[":protocol"] = []string{"pingpong"}
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+	c := &http.Client{Transport: tr}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	<-reqDone
+}
+
+func TestTransportExtendedConnect_PipeBody(t *testing.T) {
+	reqDone := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		defer close(reqDone)
+		handleServerPingPong(t, w, r)
+	}, optOnlyServer)
+	defer st.Close()
+
+	rout, wc := io.Pipe()
+
+	req, err := http.NewRequest("CONNECT", st.ts.URL, rout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header[":protocol"] = []string{"pingpong"}
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+	c := &http.Client{Transport: tr}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	handleClientPingPong(t, resp.Body, wc)
+	wc.Close()
+	<-reqDone
+}
+
+func handleClientPingPong(t *testing.T, r io.Reader, w io.Writer) {
+	t.Helper()
+	if _, err := io.WriteString(w, "ping"); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if n, err := io.Copy(&buf, io.LimitReader(r, 4)); err != nil || n != 4 {
+		t.Errorf("Read = %d, %v; want 4, nil", n, err)
+	}
+	if got, want := buf.String(), "pong"; got != want {
+		t.Errorf("Read %q; want %q", got, want)
+	}
+	if buf.String() != "pong" {
+		t.Errorf("Read = %q; want pong", buf.String())
+	}
+}
+
+func TestTransportExtendedConnectDisabled(t *testing.T) {
+	testHookDisableConnectProtocol = true
+	t.Cleanup(func() {
+		testHookDisableConnectProtocol = false
+	})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("Should have resulted in protocol error")
+	})
+	defer st.Close()
+
+	req, err := http.NewRequest("CONNECT", st.ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header[":protocol"] = []string{"pingpong"}
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+	c := &http.Client{Transport: tr}
+
+	if _, err := c.Do(req); !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("Should have resulted in not supported error. Got err: %v", err)
+	}
+}
+
 type headerType int
 
 const (
